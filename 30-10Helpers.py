@@ -1,3 +1,25 @@
+import os
+import sys
+import ast
+import warnings
+
+import json
+import pandas as pd
+import geopandas as gpd
+from sqlalchemy import create_engine
+from fiona.drvsupport import supported_drivers
+import subprocess as sub
+
+def query_footprint(state_abbr, fips, provider_id, tech_code, max_download, max_upload, br_code):
+    query = f"""
+        SELECT * FROM
+        ww_get_all_cb_polygons_20(ARRAY[{state_abbr}], 
+        ARRAY[{fips}], 
+        ARRAY[{provider_id}], ARRAY[{tech_code}], 
+        ARRAY[{max_download}], ARRAY[{max_upload}], 
+        ARRAY[{br_code}]);
+    """
+    return query
 
 def write_gradient_ranges_staticly(gdf, path=r'C:\OSGeo4W\processing_utilities'):
     range_dict = {

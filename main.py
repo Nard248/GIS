@@ -6,17 +6,189 @@ import warnings
 import json
 import pandas as pd
 import geopandas as gpd
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, Table, Column, Integer, String, MetaData, text
 from fiona.drvsupport import supported_drivers
-from shapely.geometry import Point
-from shapely.geometry.base import BaseGeometry
 import subprocess as sub
+
+from sqlalchemy.orm import sessionmaker
+from datetime import datetime
 
 warnings.filterwarnings('ignore')
 
 supported_drivers['KML'] = 'rw'
 supported_drivers['sqlite'] = 'rw'
 supported_drivers['LIBKML'] = 'rw'
+
+
+def query_footprint(state_abbr, fips, provider_id, tech_code, max_download, max_upload, br_code):
+    query = f"""
+        SELECT * FROM
+        ww_get_all_cb_polygons_20(ARRAY[{state_abbr}], 
+        ARRAY[{fips}], 
+        ARRAY[{provider_id}], ARRAY[{tech_code}], 
+        ARRAY[{max_download}], ARRAY[{max_upload}], 
+        ARRAY[{br_code}]);
+    """
+    print(query)
+    return query
+
+
+def query_locations(state_abbr, fips):
+    query = f"""
+SELECT fcc.*                                 ,
+       stags.categories_served_unserved      ,
+       stags.categories_cd_ucd               ,
+       stags.categories_mso                  ,
+       stags.categories_cafii                ,
+       stags.categories_rdof                 ,
+       stags.categories_other_federal_grants ,
+       stags.categories_unserved_and_unfunded,
+       stags.categories_high_cost            ,
+       uc.county_name                        ,
+       tgs.wired_dl25_ul3_r                  ,
+       tgs.wired_dl100_ul20_r                ,
+       tgs.terrestrial_dl25_ul3_r            ,
+       tgs.terrestrial_dl100_ul20_r          ,
+       tgs.wiredlfw_dl25_ul3_r               ,
+       tgs.wiredlfw_dl100_ul20_r             ,
+       tgs.wired_dl25_ul3_b                  ,
+       tgs.wired_dl100_ul20_b                ,
+       tgs.terrestrial_dl25_ul3_b            ,
+       tgs.terrestrial_dl100_ul20_b          ,
+       tgs.wiredlfw_dl25_ul3_b               ,
+       tgs.wiredlfw_dl100_ul20_b
+    FROM us_sw2020_fabric_harvested_rel4_full fcc
+        INNER JOIN fcc_bdc_fabric_rel4 stags ON fcc.fcc_location_id = stags.fcc_location_id
+        LEFT JOIN us_sw2020_fabric_harvested_new_taggs tgs on fcc.fcc_location_id = tgs.location_id
+        INNER JOIN us_counties uc ON fcc.fips_2020 = uc.fips_code
+    WHERE fcc.state_abbr = ANY(ARRAY[{state_abbr}]) AND fcc.fips_2020 = ANY(ARRAY[{fips}])
+    AND tgs.wiredlfw_dl25_ul3_r = 'U'
+    AND tgs.wiredlfw_dl25_ul3_b = 'U'
+    AND tgs.wiredlfw_dl100_ul20_r = 'U'
+    AND tgs.wiredlfw_dl100_ul20_b = 'U'
+    """
+    print(query)
+    return query
+
+
+# def get_filtered_fips(provider_id, state, con):
+#     query = f"""
+#     SELECT DISTINCT fips_code
+#     FROM us_census_block_data
+#     WHERE provider_id = ANY(%s) AND state_abbr = ANY(%s)
+#     """
+#     print(query)
+#     return pd.read_sql(query, con, params=(provider_id, state))
+#
+#
+# def create_temp_table(con, fips_codes):
+#     fips_codes.to_sql('temp_fips_codes', con, index=False, if_exists='replace', schema='public')
+#
+
+def query_counties_by_provider(provider_id, state, table_name):
+    query = f"""
+    SELECT uc.* 
+    FROM us_counties uc
+    INNER JOIN {table_name} temp ON temp.county_fips = uc.fips 
+    """
+    # WHERE fips IN
+    #     (SELECT
+    #         DISTINCT fips_code
+    #      FROM us_census_block_data cb
+    #      WHERE cb.provider_id = ANY(ARRAY[{provider_id}]) AND cb.state_abbr = ANY(ARRAY[{state}]))
+    print(query)
+    return query
+
+
+def get_federal_grants(provider_id, state_abbr, con, table_name):
+    query = f"""
+SELECT info.*, gm.geometry FROM
+(
+    SELECT gt.id,
+       ag.agency_name,
+       ag.funding_program_name,
+       ag.program_id,
+       gt.project_id,
+       gt.project,
+       gt.brandname,
+       gt.providerid,
+       gt.build_req,
+       gt.loc_plan,
+       gt.loc_sup,
+       gt.technology_code,
+       gt.technology_name,
+       gt.maxdown,
+       gt.maxup,
+       uc.state_abbr,
+       uc.county_name,
+       uc.fips,
+       gt.source,
+       gt.source_dat,
+       gt.categories_served
+    FROM us_federal_grants gt
+    INNER JOIN agencies ag ON gt.program_id = ag.program_id
+    INNER JOIN federal_gt_counties_pivot pivot on gt.id = pivot.grant_id
+    INNER JOIN us_counties uc on pivot.county_id = uc.id
+    INNER JOIN {table_name} temp ON uc.fips = temp.county_fips
+    WHERE uc.state_abbr = ANY(ARRAY[{state_abbr}])) info
+INNER JOIN us_federal_grants_geometry gm ON info.id = gm.id;
+    """
+    print(query)
+    gdf = gpd.read_postgis(query, con, geom_col='geometry', crs='ESRI:102008')
+    return gdf
+
+
+def get_hex(provider_id, state, con, table_name):
+    query = f"""
+    SELECT h3.*
+    FROM us_fcc_joined_h3_resolution8_test h3
+    INNER JOIN {table_name} temp ON h3.county_fips = temp.county_fips
+    """
+    print(query)
+    # WHERE
+    # county_fips
+    # IN(SELECT
+    # DISTINCT
+    # fips_code
+    # FROM
+    # us_census_block_data
+    # cb
+    # WHERE
+    # cb.provider_id = ANY(ARRAY[{provider_id}])
+    # AND
+    # cb.state_abbr = ANY(ARRAY[{state}]));
+    hex = gpd.GeoDataFrame.from_postgis(query, con, geom_col='geom', crs='EPSG:4326').to_crs('ESRI:102008')
+
+    return hex
+
+
+def get_fip_codes(polygon_data, con, state_abbr):
+    query = f"""
+        SELECT state_abbr,fips,county_name
+        FROM us_counties
+        WHERE ST_Intersects(
+            geom,
+            ST_GeomFromText('{polygon_data.geometry.iloc[0]}', 102008)) AND state_abbr = ANY(ARRAY[{state_abbr}])
+    """
+    counties = pd.read_sql(query, con)
+    print(query)
+    return list(counties["fips"].unique())
+
+
+def query_state(state_abbr):
+    query = f"""
+        SELECT * FROM "USStates" WHERE "StateAbbr" = ANY(ARRAY[{state_abbr}])
+    """
+    print(query)
+    return query
+
+
+def query_counties(fips):
+    query = f"""
+        SELECT * FROM us_counties WHERE fips = ANY(ARRAY[{fips}])
+    """
+    print(query)
+    return query
 
 
 def write_gradient_ranges_staticly(gdf, path=r'C:\OSGeo4W\processing_utilities'):
@@ -57,72 +229,8 @@ def write_gradient_ranges_staticly(gdf, path=r'C:\OSGeo4W\processing_utilities')
     return save_path
 
 
-def query_footprint(state_abbr, fips, provider_id, tech_code, max_download, max_upload, br_code):
-    query = f"""
-        SELECT * FROM
-        ww_get_all_cb_polygons_20(ARRAY[{state_abbr}], 
-        ARRAY[{fips}], 
-        ARRAY[{provider_id}], ARRAY[{tech_code}], 
-        ARRAY[{max_download}], ARRAY[{max_upload}], 
-        ARRAY[{br_code}]);
-    """
-    return query
-
-
-def query_locations(state_abbr, fips):
-    query = f"""
-SELECT fcc.*                                 ,
-       stags.categories_served_unserved      ,
-       stags.categories_cd_ucd               ,
-       stags.categories_mso                  ,
-       stags.categories_cafii                ,
-       stags.categories_rdof                 ,
-       stags.categories_other_federal_grants ,
-       stags.categories_unserved_and_unfunded,
-       stags.categories_high_cost            ,
-       uc.county_name                        ,
-       tgs.wired_dl25_ul3_r                  ,
-       tgs.wired_dl100_ul20_r                ,
-       tgs.terrestrial_dl25_ul3_r            ,
-       tgs.terrestrial_dl100_ul20_r          ,
-       tgs.wiredlfw_dl25_ul3_r               ,
-       tgs.wiredlfw_dl100_ul20_r             ,
-       tgs.wired_dl25_ul3_b                  ,
-       tgs.wired_dl100_ul20_b                ,
-       tgs.terrestrial_dl25_ul3_b            ,
-       tgs.terrestrial_dl100_ul20_b          ,
-       tgs.wiredlfw_dl25_ul3_b               ,
-       tgs.wiredlfw_dl100_ul20_b
-    FROM us_sw2020_fabric_harvested_rel4_full fcc
-        INNER JOIN fcc_bdc_fabric_rel4 stags ON fcc.fcc_location_id = stags.fcc_location_id
-        LEFT JOIN us_sw2020_fabric_harvested_new_taggs tgs on fcc.fcc_location_id = tgs.location_id
-        INNER JOIN us_counties uc ON fcc.fips_2020 = uc.fips_code
-    WHERE fcc.state_abbr = ANY(ARRAY[{state_abbr}]) AND fcc.fips_2020 = ANY(ARRAY[{fips}])
-    AND tgs.wiredlfw_dl25_ul3_r = 'U'
-    AND tgs.wiredlfw_dl25_ul3_b = 'U'
-    AND tgs.wiredlfw_dl100_ul20_r = 'U'
-    AND tgs.wiredlfw_dl100_ul20_b = 'U'
-    """
-
-    return query
-
-
 def mile_to_meter(miles):
     return miles * 1609.34
-
-
-def get_hex(provider_id, state, con):
-    query = f"""
-    SELECT *
-    FROM us_fcc_joined_h3_resolution8_test
-    WHERE county_fips IN (SELECT
-        DISTINCT fips_code
-        FROM us_census_block_data cb
-        WHERE cb.provider_id = ANY(ARRAY[{provider_id}]) AND cb.state_abbr = ANY(ARRAY[{state}]));
-    """
-    hex = gpd.GeoDataFrame.from_postgis(query, con, geom_col='geom', crs='EPSG:4326').to_crs('ESRI:102008')
-
-    return hex
 
 
 def create_formatted_excel(provider_name, market, unserved_unfunded_FP,
@@ -210,19 +318,6 @@ def create_formatted_excel(provider_name, market, unserved_unfunded_FP,
     writer.close()
 
 
-def get_fip_codes(polygon_data, con, state_abbr):
-    query = f"""
-        SELECT state_abbr,fips,county_name
-        FROM us_counties
-        WHERE ST_Intersects(
-            geom,
-            ST_GeomFromText('{polygon_data.geometry.iloc[0]}', 102008)) AND state_abbr = ANY(ARRAY[{state_abbr}])
-    """
-    counties = pd.read_sql(query, con)
-
-    return list(counties["fips"].unique())
-
-
 def call_qgis_for_30_10(name_of_project, state_name, unserved_unfunded_in_fp, unserved_unfunded_10,
                         unserved_unfunded_30, state_polygon, county_polygon, cb_footprint,
                         cb_footprint_10, cb_footprint_30, provider_name, project_path, hex_layer, counties_footprint,
@@ -238,71 +333,6 @@ def call_qgis_for_30_10(name_of_project, state_name, unserved_unfunded_in_fp, un
 
     print(stdout, stderr)
     return stdout, stderr
-
-
-def query_state(state_abbr):
-    query = f"""
-        SELECT * FROM "USStates" WHERE "StateAbbr" = ANY(ARRAY[{state_abbr}])
-    """
-    return query
-
-
-def query_counties(fips):
-    query = f"""
-        SELECT * FROM us_counties WHERE fips = ANY(ARRAY[{fips}])
-    """
-    return query
-
-
-def query_counties_by_provider(provider_id, state):
-    query = f"""
-    SELECT * 
-    FROM us_counties 
-    WHERE fips IN 
-        (SELECT 
-            DISTINCT fips_code 
-         FROM us_census_block_data cb 
-         WHERE cb.provider_id = ANY(ARRAY[{provider_id}]) AND cb.state_abbr = ANY(ARRAY[{state}]))
-    """
-    return query
-
-
-def get_federal_grants(provider_id, state, con):
-    query = f"""
-SELECT gt.id,
-       ag.agency_name,
-       ag.funding_program_name,
-       ag.program_id,
-       gt.project_id,
-       gt.project,
-       gt.brandname,
-       gt.providerid,
-       gt.build_req,
-       gt.loc_plan,
-       gt.loc_sup,
-       gt.technology_code,
-       gt.technology_name,
-       gt.maxdown,
-       gt.maxup,
-       uc.state_abbr,
-       uc.county_name,
-       uc.fips,
-       gt.source,
-       gt.source_dat,
-       gt.categories_served,
-       gt.geometry
-    FROM us_federal_grants gt
-    INNER JOIN agencies ag ON gt.program_id = ag.program_id
-    INNER JOIN federal_gt_counties_pivot pivot on gt.id = pivot.grant_id
-    INNER JOIN us_counties uc on pivot.county_id = uc.id
-    WHERE EXISTS(SELECT 1 
-                 FROM us_census_block_data cb 
-                 WHERE cb.provider_id = ANY(ARRAY[[{provider_id}]]) 
-                   AND cb.state_abbr = ANY(ARRAY[[{state}]])
-                   AND cb.fips_code = uc.fips_code)
-    """
-    gdf = gpd.read_postgis(query, con, geom_col='geometry', crs='ESRI:102008')
-    return gdf
 
 
 def main():
@@ -336,6 +366,33 @@ def main():
     db_connection_url = "postgresql://postgresqlwireless2020:software2020!!@wirelesspostgresqlflexible.postgres.database.azure.com:5432/wiroidb2"
     con = create_engine(db_connection_url)
     try:
+        metadata = MetaData()
+
+        current_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        table_name = f"temp_fips_{current_timestamp}"
+
+        temp_fips_table = Table(
+            table_name, metadata,
+            Column('id', Integer, primary_key=True, autoincrement=True),
+            Column('county_fips', String(255))
+        )
+
+        metadata.create_all(con)
+
+        Session = sessionmaker(bind=con)
+        session = Session()
+
+        insert_data_query = f"""
+        INSERT INTO {table_name} (county_fips)
+        SELECT DISTINCT fips_code
+        FROM us_census_block_data cb
+        WHERE provider_id = ANY(ARRAY[{provider_id}]) AND cb.state_abbr = ANY(ARRAY[{state_abbr}]);
+        """
+
+        session.execute(
+            text(insert_data_query))
+        session.commit()
+
         query_fp = query_footprint(state_abbr, fips, provider_id, tech_code, max_download, max_upload, br_code)
         footprint_raw = gpd.GeoDataFrame.from_postgis(query_fp, con, geom_col='Geometry',
                                                       crs='EPSG:4326').to_crs("ESRI:102008")
@@ -361,7 +418,7 @@ def main():
         counties = gpd.GeoDataFrame.from_postgis(query_counties(fips), con, geom_col='geom', crs='ESRI:102008').to_crs(
             'EPSG:4326')
 
-        counties_fp = gpd.GeoDataFrame.from_postgis(query_counties_by_provider(provider_id, state_abbr), con,
+        counties_fp = gpd.GeoDataFrame.from_postgis(query_counties_by_provider(provider_id, state_abbr, table_name), con,
                                                     geom_col='geom',
                                                     crs='ESRI:102008').to_crs(
             'EPSG:4326')
@@ -391,7 +448,7 @@ def main():
 
         thirty_mile_dif = gpd.overlay(thirty_mile_dif, state, how='intersection')
 
-        hex_gdf = get_hex(provider_id, state_abbr, con)
+        hex_gdf = get_hex(provider_id, state_abbr, con, table_name=table_name)
 
         joined_gdf = gpd.sjoin(hex_gdf, locations, how="inner", op='contains')
 
@@ -424,7 +481,7 @@ def main():
         locations_within_counties = locations_within_counties[locations.columns].drop_duplicates(
             subset='fcc_location_id', keep='last')
 
-        federal_grants = get_federal_grants(provider_id, state_abbr, con).to_crs('EPSG:4326')
+        federal_grants = get_federal_grants(provider_id, state_abbr, con, table_name=table_name).to_crs('EPSG:4326')
 
         clipped_geometries = []
         counties_fl = counties_fp.dissolve()
@@ -506,13 +563,21 @@ def main():
         call_qgis_for_30_10(f'{state_name} BufferedFootprint', state_name, unserved_unfunded_in_fp,
                             unserved_unfunded_10, unserved_unfunded_30, state_polygon, county_polygon, cb_footprint,
                             cb_footprint_10, cb_footprint_30, provider_name, save_path, hex_layer, counties_footprint,
-                            locations_in_counties, gradient_path, ntia_path, rus_path, fcc_path, usac_path, treasury_path)
+                            locations_in_counties, gradient_path, ntia_path, rus_path, fcc_path, usac_path,
+                            treasury_path)
         path_excel = os.path.join(save_path, f'{state_name}_NumberReport.xlsx')
 
         create_formatted_excel(provider_name, state_name, len(locations_in_cb_footprint),
                                len(locations_in_10mileBuffer),
                                len(locations_in_30mileBuffer), len(locations_within_counties), path_excel,
                                locations_within_counties, locations_in_cb_footprint)
+        delete_table_query = f"DROP TABLE IF EXISTS {table_name};"
+
+        # Execute the delete query
+        session.execute(text(delete_table_query))
+        session.commit()
+
+        session.close()
     finally:
         con = 0
 
